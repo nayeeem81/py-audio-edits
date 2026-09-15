@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyTorch Audio Tensor Editor</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="app-shell">
+    <header>
+      <p class="eyebrow">PyTorch waveform workspace</p>
+      <h1>Audio Tensor Editor</h1>
+      <p>Upload audio, shape the waveform, preview a selection, and export the edited tensor.</p>
+    </header>
+
+    <section class="panel upload-panel">
+      <label class="file-picker">
+        <span>Audio file</span>
+        <input id="audio-file" type="file" accept=".wav,.mp3,.webm,.weba,.ogg,audio/wav,audio/mpeg,audio/webm,audio/ogg">
+      </label>
+      <button id="upload-button" class="primary">Upload audio</button>
+      <span id="file-name" class="muted">No file selected</span>
+    </section>
+
+    <section class="panel image-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Pitch visualizer image</h2>
+          <p id="image-name" class="muted">Upload an image to transform with pitch and time.</p>
+        </div>
+      </div>
+      <div class="waveform-chart">
+        <div id="waveform-scroll" class="waveform-scroll">
+          <canvas id="waveform" aria-label="Audio spectrogram"></canvas>
+        </div>
+      </div>
+      <canvas id="image-canvas" aria-label="Image transformed by the audio pitch path"></canvas>
+      <div class="image-upload-controls">
+        <label class="file-picker">
+          <span>Image file</span>
+          <input id="image-file" type="file" accept="image/png,image/jpeg,image/webp">
+        </label>
+        <button id="image-upload-button" disabled>Load image</button>
+      </div>
+    </section>
+
+    <section class="controls-grid">
+      <div class="panel control">
+        <label for="pitch-brightness-slider">Pitch brightness <output id="pitch-brightness-value">100%</output></label>
+        <input id="pitch-brightness-slider" type="range" min="0" max="100" step="1" value="100">
+        <small>Adjust the visible pitch trace without changing the audio.</small>
+      </div>
+      <div class="panel control">
+        <label for="gain-slider">Gain <output id="gain-value">1.00x</output></label>
+        <input id="gain-slider" type="range" min="0" max="2" step="0.01" value="1">
+        <small>0 silences the audio; 1 keeps it unchanged; 2 doubles it.</small>
+      </div>
+      <div class="panel control">
+        <label for="rate-slider">Sample rate <output id="rate-value">44100 Hz</output></label>
+        <input id="rate-slider" type="range" min="8000" max="192000" step="100" value="44100">
+        <small>Changing this resamples the tensor and updates its duration.</small>
+      </div>
+    </section>
+
+    <section class="panel actions">
+      <button id="save-button" class="primary" disabled>Keep changes</button>
+      <button id="play-button" disabled>Play</button>
+      <button id="download-selection" disabled>Download</button>
+    </section>
+
+    <p id="error" class="error" role="alert"></p>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
