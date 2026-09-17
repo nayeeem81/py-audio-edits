@@ -38,5 +38,7 @@ button.primary { background: #197f7d; color: white; }
 output { color: #197f7d; }
 input[type=range] { width: 100%; accent-color: #197f7d; }
 .actions { flex-wrap: wrap; }
+.break-duration { display: grid; gap: 4px; color: #687887; font-size: .82rem; font-weight: 700; }
+.break-duration input { width: 100px; padding: 9px; border: 1px solid #cbd7e1; border-radius: 8px; font: inherit; color: #17212b; }
 .error { min-height: 1.4em; margin: 14px 0; color: #b3261e; font-weight: 700; }
 @media (max-width: 700px) { .controls-grid { grid-template-columns: 1fr; } .panel-heading { align-items: flex-start; } .upload-panel, .actions, .image-upload-controls { align-items: stretch; flex-direction: column; } button { width: 100%; } }

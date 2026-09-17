@@ -4,7 +4,8 @@ import io
 import wave
 import uuid
 import base64
-from dataclasses import dataclass
+import zipfile
+from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import torch
@@ -21,10 +22,16 @@ app = Flask(__name__)
 @dataclass
 class AudioState:
     waveform: torch.Tensor
+    original_waveform: torch.Tensor
     sample_rate: int
     filename: str
     image: Optional[torch.Tensor] = None
     image_filename: Optional[str] = None
+    pitch_tensors: list[torch.Tensor] = field(default_factory=list)
+    random_tensor: Optional[torch.Tensor] = None
+    random_stack: list[torch.Tensor] = field(default_factory=list)
+    tensor_stacks: list[list[torch.Tensor]] = field(default_factory=list)
+    break_seconds: float = 7.0
 
 
 def _spectrogram(state: AudioState) -> tuple[torch.Tensor, torch.Tensor]:
@@ -43,6 +50,58 @@ def _spectrogram(state: AudioState) -> tuple[torch.Tensor, torch.Tensor]:
     magnitude = transformed.abs().mean(dim=0)
     frequencies = torch.fft.rfftfreq(window_length, d=1 / state.sample_rate)
     return magnitude, frequencies
+
+
+def _stack_spectrograms(state: AudioState) -> list[dict]:
+    result = []
+    for tensor in state.random_stack:
+        segment_state = AudioState(
+            waveform=tensor,
+            original_waveform=tensor,
+            sample_rate=state.sample_rate,
+            filename=state.filename,
+        )
+        magnitude, frequencies = _spectrogram(segment_state)
+        magnitude = torch.log1p(magnitude)
+        magnitude = magnitude / magnitude.amax().clamp_min(1e-8)
+        max_frames = 300
+        if magnitude.shape[1] > max_frames:
+            step = (magnitude.shape[1] + max_frames - 1) // max_frames
+            magnitude = magnitude[:, ::step]
+        if magnitude.shape[0] > 256:
+            magnitude = magnitude[::2]
+            frequencies = frequencies[::2]
+        result.append({
+            "values": magnitude.transpose(0, 1).tolist(),
+            "pitches": frequencies[magnitude.argmax(dim=0)].tolist(),
+            "pitch_magnitudes": magnitude.amax(dim=0).tolist(),
+            "duration": tensor.shape[1] / state.sample_rate,
+        })
+    return result
+
+
+def _spectrogram_payload(waveform: torch.Tensor, sample_rate: int) -> dict:
+    segment_state = AudioState(
+        waveform=waveform,
+        original_waveform=waveform,
+        sample_rate=sample_rate,
+        filename="stack",
+    )
+    magnitude, frequencies = _spectrogram(segment_state)
+    magnitude = torch.log1p(magnitude)
+    magnitude = magnitude / magnitude.amax().clamp_min(1e-8)
+    max_frames = 900
+    if magnitude.shape[1] > max_frames:
+        step = (magnitude.shape[1] + max_frames - 1) // max_frames
+        magnitude = magnitude[:, ::step]
+    if magnitude.shape[0] > 256:
+        magnitude = magnitude[::2]
+        frequencies = frequencies[::2]
+    return {
+        "values": magnitude.transpose(0, 1).tolist(),
+        "pitches": frequencies[magnitude.argmax(dim=0)].tolist(),
+        "pitch_magnitudes": magnitude.amax(dim=0).tolist(),
+    }
 
 
 SESSIONS: Dict[str, AudioState] = {}
@@ -77,12 +136,16 @@ def _image_data_url(image: torch.Tensor) -> str:
 
 def _export(state: AudioState, start: Optional[int] = None, end: Optional[int] = None):
     waveform = state.waveform[:, start:end] if start is not None and end is not None else state.waveform
+    return _export_waveform(waveform, state.sample_rate)
+
+
+def _export_waveform(waveform: torch.Tensor, sample_rate: int):
     output = io.BytesIO()
     pcm = (waveform.cpu().clamp(-1, 1).mul(32767).to(torch.int16).t().contiguous().numpy()).tobytes()
     with wave.open(output, "wb") as writer:
         writer.setnchannels(waveform.shape[0])
         writer.setsampwidth(2)
-        writer.setframerate(state.sample_rate)
+        writer.setframerate(sample_rate)
         writer.writeframes(pcm)
     output.seek(0)
     return output
@@ -144,6 +207,7 @@ def upload():
     session_id = uuid.uuid4().hex
     SESSIONS[session_id] = AudioState(
         waveform=waveform.float().contiguous(),
+        original_waveform=waveform.float().contiguous().clone(),
         sample_rate=int(sample_rate),
         filename=audio_file.filename,
     )
@@ -233,6 +297,87 @@ def apply_changes():
     return jsonify(_audio_metadata(state))
 
 
+@app.post("/api/break-tensor")
+def break_tensor():
+    try:
+        state = SESSIONS[_session_id()]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        break_seconds = float(payload.get("seconds", 7))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Break time must be a number of seconds."}), 400
+    if not 0.1 <= break_seconds <= 3600:
+        return jsonify({"error": "Break time must be between 0.1 and 3600 seconds."}), 400
+
+    chunk_samples = max(1, int(round(state.sample_rate * break_seconds)))
+    sample_count = state.original_waveform.shape[1]
+    segments: list[torch.Tensor] = []
+    for start in range(0, sample_count, chunk_samples):
+        stop = min(start + chunk_samples, sample_count)
+        segment = state.original_waveform[:, start:stop].contiguous()
+        if segment.shape[1] > 0:
+            segments.append(segment)
+
+    state.pitch_tensors = segments
+    state.random_tensor = None
+    state.random_stack = []
+    state.tensor_stacks = []
+    state.break_seconds = break_seconds
+    return jsonify({
+        "tensor_count": len(state.pitch_tensors),
+        "chunk_seconds": break_seconds,
+        "chunk_samples": chunk_samples,
+        "samples": int(sample_count),
+    })
+
+
+@app.post("/api/random-tensor")
+def random_tensor():
+    try:
+        state = SESSIONS[_session_id()]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not state.pitch_tensors:
+        return jsonify({"error": "Break the original tensor into 7-second tensors first."}), 400
+
+    if state.random_stack:
+        state.tensor_stacks.append([tensor.clone() for tensor in state.random_stack])
+
+    state.random_stack = [
+        state.pitch_tensors[index].clone()
+        for index in np.random.permutation(len(state.pitch_tensors))
+    ]
+    state.random_tensor = torch.cat(state.random_stack, dim=1)
+    stack_spectrogram = _spectrogram_payload(state.random_tensor, state.sample_rate)
+    return jsonify({
+        "tensor_count": len(state.pitch_tensors),
+        "stack_count": len(state.random_stack),
+        "stack_history_count": len(state.tensor_stacks),
+        "random_samples": int(state.random_tensor.shape[1]),
+        "random_duration": state.random_tensor.shape[1] / state.sample_rate,
+        "segments": _stack_spectrograms(state),
+        "stack_spectrogram": stack_spectrogram,
+    })
+
+
+@app.get("/api/random-spectrogram")
+def random_spectrogram():
+    try:
+        state = SESSIONS[_session_id()]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not state.random_stack:
+        return jsonify({"error": "Create a random tensor stack first."}), 400
+    return jsonify({
+        "segments": _stack_spectrograms(state),
+        "sample_rate": state.sample_rate,
+        "duration": state.random_tensor.shape[1] / state.sample_rate,
+    })
+
+
 @app.post("/api/resample")
 def resample():
     try:
@@ -257,6 +402,45 @@ def download():
         state = SESSIONS[_session_id()]
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+
+    tensor_name = request.args.get("tensor", "current")
+    if tensor_name == "stacks":
+        stacks = [*state.tensor_stacks]
+        if state.random_stack:
+            stacks.append(state.random_stack)
+        if not stacks:
+            return jsonify({"error": "Create at least one random tensor stack before downloading."}), 400
+
+        archive = io.BytesIO()
+        base_name = state.filename.rsplit(".", 1)[0]
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            for index, stack in enumerate(stacks, start=1):
+                waveform = torch.cat(stack, dim=1)
+                wav = _export_waveform(waveform, state.sample_rate)
+                output.writestr(f"{base_name}_stack_{index}.wav", wav.getvalue())
+        archive.seek(0)
+        return send_file(
+            archive,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"{base_name}_stacks.zip",
+        )
+    if tensor_name == "original":
+        return send_file(
+            _export_waveform(state.original_waveform, state.sample_rate),
+            mimetype="audio/wav",
+            as_attachment=True,
+            download_name=f"{state.filename.rsplit('.', 1)[0]}_original.wav",
+        )
+    if tensor_name == "random":
+        if state.random_tensor is None:
+            return jsonify({"error": "Create a random tensor before playing it."}), 400
+        return send_file(
+            _export_waveform(state.random_tensor, state.sample_rate),
+            mimetype="audio/wav",
+            as_attachment=True,
+            download_name=f"{state.filename.rsplit('.', 1)[0]}_random.wav",
+        )
 
     start = request.args.get("start", type=int)
     end = request.args.get("end", type=int)

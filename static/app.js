@@ -11,7 +11,11 @@ const pitchSlider = document.querySelector("#pitch-slider");
 const pitchBrightnessSlider = document.querySelector("#pitch-brightness-slider");
 const rateSlider = document.querySelector("#rate-slider");
 const saveButton = document.querySelector("#save-button");
+const breakTensorButton = document.querySelector("#break-tensor-button");
+const breakDurationInput = document.querySelector("#break-duration");
+const randomTensorButton = document.querySelector("#random-tensor-button");
 const playButton = document.querySelector("#play-button");
+const playRandomButton = document.querySelector("#play-random-button");
 const downloadButton = document.querySelector("#download-selection");
 const statusEl = document.querySelector("#status");
 const metadataEl = document.querySelector("#metadata");
@@ -27,9 +31,12 @@ let metadata = null;
 let spectrogram = [];
 let pitches = [];
 let pitchMagnitudes = [];
+let randomSegments = [];
+let randomStackSpectrogram = [];
 let sourceImageData = null;
 let audioContext = null;
 let playback = null;
+let activeRandomSegment = -1;
 const PIXELS_PER_FRAME = 3;
 
 function setError(message = "") { errorEl.textContent = message; }
@@ -38,7 +45,13 @@ function headers() { return { "Content-Type": "application/json", "X-Audio-Sessi
 
 async function requestJson(url, options = {}) {
   const response = await fetch(url, options);
-  const body = await response.json();
+  const text = await response.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(`The server returned an invalid response (${response.status}).`);
+  }
   if (!response.ok) throw new Error(body.error || "The request failed.");
   return body;
 }
@@ -69,8 +82,10 @@ function renderImageCanvas(progress = 0) {
 }
 
 function renderSpectrogram() {
-  const frameCount = spectrogram.length;
-  const frequencyCount = spectrogram[0]?.length || 0;
+  const frameCount = randomSegments.length
+    ? randomSegments.reduce((total, segment) => total + segment.values.length, 0)
+    : spectrogram.length;
+  const frequencyCount = randomSegments[0]?.values[0]?.length || spectrogram[0]?.length || 0;
   const chartWidth = Math.max(waveformScroll.clientWidth, frameCount * PIXELS_PER_FRAME);
   const chartHeight = canvas.clientHeight || 270;
   const ratio = window.devicePixelRatio || 1;
@@ -84,14 +99,37 @@ function renderSpectrogram() {
 
   const image = context.createImageData(chartWidth, chartHeight);
   for (let x = 0; x < chartWidth; x += 1) {
-    const frame = spectrogram[Math.min(frameCount - 1, Math.floor(x / chartWidth * frameCount))];
+    let frame;
+    let stackSegment = null;
+    if (randomSegments.length) {
+      const frameIndex = Math.min(
+        randomStackSpectrogram.length - 1,
+        Math.floor(x / chartWidth * randomStackSpectrogram.length),
+      );
+      frame = randomStackSpectrogram[frameIndex];
+      const progress = x / chartWidth;
+      const totalDuration = randomSegments.reduce((total, item) => total + item.duration, 0);
+      let elapsed = 0;
+      for (const segment of randomSegments) {
+        elapsed += segment.duration / totalDuration;
+        if (progress < elapsed) {
+          stackSegment = segment;
+          break;
+        }
+      }
+    } else {
+      const frameIndex = Math.min(frameCount - 1, Math.floor(x / chartWidth * frameCount));
+      frame = spectrogram[frameIndex];
+    }
     for (let y = 0; y < chartHeight; y += 1) {
       const bin = Math.min(frequencyCount - 1, Math.floor((1 - y / chartHeight) * frequencyCount));
-      const intensity = Math.pow(frame[bin] || 0, 0.7);
+      const intensity = Math.min(1, Math.max(0, Math.pow(Number(frame?.[bin]) || 0, 0.42)));
       const offset = (y * chartWidth + x) * 4;
-      image.data[offset] = Math.round(8 + intensity * 225);
-      image.data[offset + 1] = Math.round(31 + intensity * 175);
-      image.data[offset + 2] = Math.round(55 + intensity * 90);
+      const color = stackSegment?.color || [8, 31, 55];
+      const heat = stackSegment ? intensity : intensity * 0.9;
+      image.data[offset] = Math.round(color[0] + heat * (255 - color[0]));
+      image.data[offset + 1] = Math.round(color[1] + heat * (220 - color[1]));
+      image.data[offset + 2] = Math.round(color[2] + heat * (150 - color[2]));
       image.data[offset + 3] = 255;
     }
   }
@@ -105,6 +143,19 @@ function renderSpectrogram() {
       waveformScroll.scrollLeft = Math.min(maxScroll, Math.max(0, playedX - viewportWidth * 0.35));
       context.fillStyle = "rgb(255 126 38 / 0.42)";
       context.fillRect(0, 0, chartWidth * progress, chartHeight);
+  }
+
+  if (randomSegments.length) {
+    let elapsed = 0;
+    randomSegments.forEach((segment, index) => {
+      const totalDuration = randomSegments.reduce((total, item) => total + item.duration, 0);
+      const x = chartWidth * elapsed / totalDuration;
+      elapsed += segment.duration;
+      const endX = chartWidth * elapsed / totalDuration;
+      context.strokeStyle = index === activeRandomSegment ? "#ffffff" : "rgb(255 255 255 / 0.35)";
+      context.lineWidth = index === activeRandomSegment ? 3 : 1;
+      context.strokeRect(x, 0, Math.max(1, endX - x), chartHeight);
+    });
   }
 
   context.strokeStyle = `rgb(247 200 115 / ${Number(pitchBrightnessSlider.value) / 100})`;
@@ -133,6 +184,14 @@ function animatePlayback(timestamp) {
   if (!playback) return;
   if (timestamp - playback.lastPaint >= 100) {
     playback.lastPaint = timestamp;
+    if (playback.random) {
+      const elapsed = audioContext.currentTime - playback.startedAt;
+      let accumulated = 0;
+      activeRandomSegment = randomSegments.findIndex((segment) => {
+        accumulated += segment.duration;
+        return elapsed < accumulated;
+      });
+    }
     renderSpectrogram();
     renderImageCanvas(Math.min(1, (audioContext.currentTime - playback.startedAt) / playback.duration));
   }
@@ -147,6 +206,9 @@ async function refreshSpectrogram() {
   spectrogram = body.values;
   pitches = body.pitches;
   pitchMagnitudes = body.pitch_magnitudes;
+  randomSegments = [];
+  randomStackSpectrogram = [];
+  activeRandomSegment = -1;
   rateSlider.value = body.sample_rate;
   if (metadataEl) {
     metadataEl.textContent = `${body.filename} · ${body.channels} channel(s) · ${body.sample_rate} Hz · ${body.duration.toFixed(2)} seconds`;
@@ -193,7 +255,7 @@ async function upload() {
     if (!response.ok) throw new Error(body.error);
     sessionId = body.session_id;
     await refreshSpectrogram();
-    [saveButton, playButton, downloadButton, imageUploadButton].forEach((button) => { button.disabled = false; });
+    [saveButton, breakTensorButton, playButton, downloadButton, imageUploadButton, breakDurationInput].forEach((button) => { button.disabled = false; });
     setStatus("Loaded");
   } catch (error) {
     setError(error.message);
@@ -223,9 +285,51 @@ async function saveChanges() {
   }
 }
 
-async function playAudio() {
+async function breakTensor() {
+  setError("");
   try {
-    const response = await fetch("/api/download", { headers: { "X-Audio-Session": sessionId } });
+    const body = await requestJson("/api/break-tensor", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ seconds: Number(breakDurationInput.value) }),
+    });
+    breakDurationInput.value = body.chunk_seconds;
+    breakDurationInput.disabled = false;
+    randomTensorButton.disabled = false;
+    playRandomButton.disabled = true;
+    randomSegments = [];
+    renderSpectrogram();
+    setStatus(`Original tensor broken into ${body.tensor_count} ${body.chunk_seconds}-second tensors`);
+  } catch (error) {
+    setError(error.message);
+    setStatus("Error");
+  }
+}
+
+async function createRandomTensor() {
+  setError("");
+  try {
+    const body = await requestJson("/api/random-tensor", { method: "POST", headers: headers() });
+    randomSegments = body.segments.map((segment, index) => ({
+      ...segment,
+      color: [[20, 90, 180], [170, 70, 40], [35, 135, 85], [140, 70, 170], [180, 125, 30]][index % 5],
+    }));
+    randomStackSpectrogram = body.stack_spectrogram.values;
+    spectrogram = randomStackSpectrogram;
+    pitches = body.stack_spectrogram.pitches;
+    pitchMagnitudes = body.stack_spectrogram.pitch_magnitudes;
+    renderSpectrogram();
+    playRandomButton.disabled = false;
+    setStatus(`Random stack has ${body.stack_count} tensors (${body.random_duration.toFixed(2)} seconds)`);
+  } catch (error) {
+    setError(error.message);
+    setStatus("Error");
+  }
+}
+
+async function playAudio(tensor = "original") {
+  try {
+    const response = await fetch(`/api/download?tensor=${tensor}`, { headers: { "X-Audio-Session": sessionId } });
     if (!response.ok) throw new Error("Could not load the audio.");
     audioContext = audioContext || new AudioContext();
     await audioContext.resume();
@@ -234,11 +338,18 @@ async function playAudio() {
     const source = audioContext.createBufferSource();
     source.buffer = buffer;
     source.connect(audioContext.destination);
-    playback = { source, startedAt: audioContext.currentTime, duration: buffer.duration, lastPaint: 0 };
+    playback = {
+      source,
+      startedAt: audioContext.currentTime,
+      duration: buffer.duration,
+      lastPaint: 0,
+      random: tensor === "random",
+    };
     playback.animationFrame = requestAnimationFrame(animatePlayback);
     source.onended = () => {
       if (playback?.source !== source) return;
       playback = null;
+      activeRandomSegment = -1;
       renderSpectrogram();
       setStatus("Loaded");
     };
@@ -249,11 +360,26 @@ async function playAudio() {
   }
 }
 
-function download() {
-  const link = document.createElement("a");
-  link.href = "/api/download";
-  link.setAttribute("download", "");
-  link.click();
+async function downloadStacks() {
+  setError("");
+  try {
+    const response = await fetch("/api/download?tensor=stacks", {
+      headers: { "X-Audio-Session": sessionId },
+    });
+    if (!response.ok) {
+      const body = await response.json();
+      throw new Error(body.error || "Could not download the tensor stacks.");
+    }
+    const link = document.createElement("a");
+    const objectUrl = URL.createObjectURL(await response.blob());
+    link.href = objectUrl;
+    link.download = "tensor_stacks.zip";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+    setStatus("Tensor stacks downloaded");
+  } catch (error) {
+    setError(error.message);
+  }
 }
 
 fileInput.addEventListener("change", () => { fileNameEl.textContent = fileInput.files[0]?.name || "No file selected"; });
@@ -268,5 +394,8 @@ pitchBrightnessSlider.addEventListener("input", () => {
 rateSlider.addEventListener("input", updateLabels);
 saveButton.addEventListener("click", saveChanges);
 playButton.addEventListener("click", playAudio);
-downloadButton.addEventListener("click", download);
+breakTensorButton.addEventListener("click", breakTensor);
+randomTensorButton.addEventListener("click", createRandomTensor);
+playRandomButton.addEventListener("click", () => playAudio("random"));
+downloadButton.addEventListener("click", downloadStacks);
 window.addEventListener("resize", renderSpectrogram);
