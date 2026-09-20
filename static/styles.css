@@ -31,7 +31,7 @@ button.primary { background: #197f7d; color: white; }
 .time-tick { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
 .time-tick:first-child { transform: none; }
 .time-tick:last-child { transform: translateX(-100%); }
-#waveform { display: block; width: 100%; height: 135px; border-radius: 10px; background: #081f37; }
+#waveform { display: block; width: 100%; height: 535px; border-radius: 10px; background: #081f37; }
 .controls-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin-bottom: 18px; }
 .control { display: grid; gap: 12px; }
 .control label { display: flex; justify-content: space-between; gap: 12px; font-weight: 700; }

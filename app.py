@@ -32,6 +32,9 @@ class AudioState:
     random_stack: list[torch.Tensor] = field(default_factory=list)
     tensor_stacks: list[list[torch.Tensor]] = field(default_factory=list)
     break_seconds: float = 7.0
+    clipboard: Optional[torch.Tensor] = None
+    backup_waveform: Optional[torch.Tensor] = None
+    undo_history: list[torch.Tensor] = field(default_factory=list)
 
 
 def _spectrogram(state: AudioState) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,7 +51,7 @@ def _spectrogram(state: AudioState) -> tuple[torch.Tensor, torch.Tensor]:
         return_complex=True,
     )
     magnitude = transformed.abs().mean(dim=0)
-    frequencies = torch.fft.rfftfreq(window_length, d=1 / state.sample_rate)
+    frequencies = torch.fft.rfftfreq(window_length, d=1 / (state.sample_rate * 2) )
     return magnitude, frequencies
 
 
@@ -190,6 +193,11 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/editaudio")
+def edit_audio():
+    return render_template("editaudio.html")
+
+
 @app.post("/api/upload")
 def upload():
     audio_file = request.files.get("audio")
@@ -295,6 +303,72 @@ def apply_changes():
             state.waveform, state.sample_rate, pitch, n_fft=1024, hop_length=256
         ).clamp(-1.0, 1.0)
     return jsonify(_audio_metadata(state))
+
+
+@app.post("/api/tensor-edit")
+def tensor_edit():
+    try:
+        state = SESSIONS[_session_id()]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    payload = request.get_json(silent=True) or {}
+    action = payload.get("action")
+    start = payload.get("start")
+    end = payload.get("end")
+    position = payload.get("position")
+
+    def range_value(value, name):
+        if not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer.")
+        if not 0 <= value <= state.waveform.shape[1]:
+            raise ValueError(f"{name} is outside the tensor.")
+        return value
+
+    try:
+        if action in {"copy", "cut", "delete"}:
+            start = range_value(start, "Selection start")
+            end = range_value(end, "Selection end")
+            if end <= start:
+                raise ValueError("The selection must contain audio.")
+        if action == "load_original":
+            state.undo_history.append(state.waveform.clone())
+            state.waveform = state.original_waveform.clone()
+        elif action == "backup":
+            state.backup_waveform = state.waveform.clone()
+        elif action == "copy":
+            state.clipboard = state.waveform[:, start:end].clone()
+        elif action == "cut":
+            state.undo_history.append(state.waveform.clone())
+            state.clipboard = state.waveform[:, start:end].clone()
+            state.waveform = torch.cat((state.waveform[:, :start], state.waveform[:, end:]), dim=1).contiguous()
+        elif action == "delete":
+            state.undo_history.append(state.waveform.clone())
+            state.waveform = torch.cat((state.waveform[:, :start], state.waveform[:, end:]), dim=1).contiguous()
+        elif action == "paste":
+            if state.clipboard is None:
+                raise ValueError("Copy or cut a selection before pasting.")
+            position = range_value(position, "Paste position")
+            state.undo_history.append(state.waveform.clone())
+            state.waveform = torch.cat(
+                (state.waveform[:, :position], state.clipboard, state.waveform[:, position:]),
+                dim=1,
+            ).contiguous()
+        elif action == "undo":
+            if not state.undo_history:
+                raise ValueError("There is no earlier tensor state to restore.")
+            state.waveform = state.undo_history.pop()
+        else:
+            return jsonify({"error": "Unknown tensor edit action."}), 400
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    return jsonify({
+        **_audio_metadata(state),
+        "clipboard_samples": int(state.clipboard.shape[1]) if state.clipboard is not None else 0,
+        "can_undo": bool(state.undo_history),
+        "has_backup": state.backup_waveform is not None,
+    })
 
 
 @app.post("/api/break-tensor")
